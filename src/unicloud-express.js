@@ -3,15 +3,38 @@ const http = require("http");
 const url = require("url");
 const binarycase = require("binary-case");
 const isType = require("type-is");
-
+const defaultBinaryMimeTypes = [
+  "application/javascript",
+  "application/json",
+  "application/octet-stream",
+  "application/xml",
+  "font/eot",
+  "font/opentype",
+  "font/otf",
+  "image/jpeg",
+  "image/png",
+  "image/svg+xml",
+  "text/comma-separated-values",
+  "text/css",
+  "text/html",
+  "text/javascript",
+  "text/plain",
+  "text/text",
+  "text/xml",
+];
 function getPathWithQueryStringParams(event) {
   return url.format({
     pathname: event.path,
-    query: event.queryStringParameters,
+    query: event.queryStringParameters
+      ? event.queryStringParameters
+      : event.params,
   });
 }
 function getEventBody(event) {
-  return Buffer.from(event.body, event.isBase64Encoded ? "base64" : "utf8");
+  if (event.isBase64Encoded) {
+    return Buffer.from(event.body, "base64");
+  }
+  return JSON.stringify(event.body);
 }
 
 function clone(json) {
@@ -32,21 +55,9 @@ function isContentTypeBinaryMimeType(params) {
 
 function mapApiGatewayEventToHttpRequest(event, context, socketPath) {
   const headers = Object.assign({}, event.headers);
-
-  // NOTE: API Gateway is not setting Content-Length header on requests even when they have a body
-  if (event.body && !headers["Content-Length"]) {
-    const body = getEventBody(event);
-    headers["Content-Length"] = Buffer.byteLength(body);
+  if (event.body) {
+    headers["Content-Type"] = "application/json"; //workaround the apigate way tricky handler of Content-Type;
   }
-
-  const clonedEventWithoutBody = clone(event);
-  delete clonedEventWithoutBody.body;
-
-  headers["x-apigateway-event"] = encodeURIComponent(
-    JSON.stringify(clonedEventWithoutBody)
-  );
-  headers["x-apigateway-context"] = encodeURIComponent(JSON.stringify(context));
-
   return {
     method: event.httpMethod,
     path: getPathWithQueryStringParams(event),
@@ -98,14 +109,20 @@ function forwardResponseToApiGateway(server, response, resolver) {
         binaryMimeTypes: server._binaryTypes,
       });
       const body = bodyBuffer.toString(isBase64Encoded ? "base64" : "utf8");
-      const successResponse = { statusCode, body, headers, isBase64Encoded };
+
+      const successResponse = {
+        statusCode,
+        body,
+        headers,
+        isBase64Encoded,
+      };
 
       resolver.succeed({ response: successResponse });
     });
 }
 
 function forwardConnectionErrorResponseToApiGateway(error, resolver) {
-  console.log("ERROR: aws-serverless-express connection error");
+  console.log("ERROR: unicloud-serverless-express connection error");
   console.error(error);
   const errorResponse = {
     statusCode: 502, // "DNS resolution, TCP level errors, or actual HTTP parse errors" - https://nodejs.org/api/http.html#http_http_request_options_callback
@@ -117,7 +134,7 @@ function forwardConnectionErrorResponseToApiGateway(error, resolver) {
 }
 
 function forwardLibraryErrorResponseToApiGateway(error, resolver) {
-  console.log("ERROR: aws-serverless-express error");
+  console.log("ERROR: unicloud-serverless-express error");
   console.error(error);
   const errorResponse = {
     statusCode: 500,
@@ -140,7 +157,6 @@ function forwardRequestToNodeServer(server, event, context, resolver) {
     );
     if (event.body) {
       const body = getEventBody(event);
-
       req.write(body);
     }
 
@@ -179,7 +195,8 @@ function getRandomString() {
 
 function createServer(requestListener, serverListenCallback, binaryTypes) {
   const server = http.createServer(requestListener);
-
+  //如果没有传入需要base64编码的类型，则使用默认的
+  // binaryTypes = binaryTypes || defaultBinaryMimeTypes;
   server._socketPathSuffix = getRandomString();
   server._binaryTypes = binaryTypes ? binaryTypes.slice() : [];
   server.on("listening", () => {
@@ -197,7 +214,7 @@ function createServer(requestListener, serverListenCallback, binaryTypes) {
         console.warn(
           `WARNING: Attempting to listen on socket ${getSocketPath(
             server._socketPathSuffix
-          )}, but it is already in use. This is likely as a result of a previous invocation error or timeout. Check the logs for the invocation(s) immediately prior to this for root cause, and consider increasing the timeout and/or cpu/memory allocation if this is purely as a result of a timeout. aws-serverless-express will restart the Node.js server listening on a new port and continue with this request.`
+          )}, but it is already in use. This is likely as a result of a previous invocation error or timeout. Check the logs for the invocation(s) immediately prior to this for root cause, and consider increasing the timeout and/or cpu/memory allocation if this is purely as a result of a timeout. unicloud-serverless-express will restart the Node.js server listening on a new port and continue with this request.`
         );
         server._socketPathSuffix = getRandomString();
         return server.close(() => startServer(server));
@@ -211,44 +228,31 @@ function createServer(requestListener, serverListenCallback, binaryTypes) {
 }
 
 function proxy(server, event, context, resolutionMode, callback) {
-  // DEPRECATED: Legacy support
-  if (!resolutionMode) {
+  //优先使用promise模式
+  resolutionMode = resolutionMode || "PROMISE";
+  return new Promise((resolve, reject) => {
+    const promise = {
+      resolve,
+      reject,
+    };
+    //是否是直接函数调用模式，使用对应变量判断下
+    let isCallFunctionInvoke = context.PLATFORM != null;
     const resolver = makeResolver({
       context,
-      resolutionMode: "CONTEXT_SUCCEED",
+      callback,
+      promise,
+      resolutionMode,
+      isCallFunctionInvoke,
     });
+
     if (server._isListening) {
       forwardRequestToNodeServer(server, event, context, resolver);
-      return server;
     } else {
-      return startServer(server).on("listening", () =>
-        proxy(server, event, context)
+      startServer(server).on("listening", () =>
+        forwardRequestToNodeServer(server, event, context, resolver)
       );
     }
-  }
-
-  return {
-    promise: new Promise((resolve, reject) => {
-      const promise = {
-        resolve,
-        reject,
-      };
-      const resolver = makeResolver({
-        context,
-        callback,
-        promise,
-        resolutionMode,
-      });
-
-      if (server._isListening) {
-        forwardRequestToNodeServer(server, event, context, resolver);
-      } else {
-        startServer(server).on("listening", () =>
-          forwardRequestToNodeServer(server, event, context, resolver)
-        );
-      }
-    }),
-  };
+  });
 }
 
 function makeResolver(
@@ -263,6 +267,17 @@ function makeResolver(
     succeed: (params2 /* {
       response
     } */) => {
+      if (params.isCallFunctionInvoke) {
+        //直接调用的获取到响应内容然后返回下,无法处理集成式响应
+        let body = params2.response.body;
+        if (typeof body == "string") {
+          body = JSON.parse(body);
+        }
+        params2.response = body;
+      } else {
+        //url云化的使用集成式响应返回
+        params2.response.mpserverlessComposedResponse = true;
+      }
       if (params.resolutionMode === "CONTEXT_SUCCEED")
         return params.context.succeed(params2.response);
       if (params.resolutionMode === "CALLBACK")

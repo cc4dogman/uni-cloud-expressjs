@@ -23,5 +23,9 @@ exports.main = async (event, context) => {
 上面的部分即可将云函数url化之后的请求交给express框架处理
 
 ## 优化
-由于Express生态代码比较多，暂时自行优化大小
+目前使用了rollup进行代码优化，打包到dist目录，进一步降低包大小，执行：
+```bash
+npm run build
+```
+
 
